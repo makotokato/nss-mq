@@ -1,0 +1,523 @@
+# HG changeset patch
+# Parent  cd87eef15f8d5faea0a732afb3d8e435398233e6
+
+diff -r cd87eef15f8d coreconf/config.gypi
+--- a/coreconf/config.gypi	Mon Dec 16 11:56:39 2024 -0800
++++ b/coreconf/config.gypi	Fri Dec 20 22:58:24 2024 +0900
+@@ -105,6 +105,7 @@
+     'disable_arm_hw_sha1%': 0,
+     'disable_arm_hw_sha2%': 0,
+     'disable_intel_hw_sha%': 0,
++    'disable_riscv64zkn%': 0,
+     'disable_tests%': 0,
+     'disable_chachapoly%': 0,
+     'disable_deprecated_seed%': 0,
+diff -r cd87eef15f8d lib/freebl/Makefile
+--- a/lib/freebl/Makefile	Mon Dec 16 11:56:39 2024 -0800
++++ b/lib/freebl/Makefile	Fri Dec 20 22:58:24 2024 +0900
+@@ -777,6 +777,10 @@
+ $(OBJDIR)/$(PROG_PREFIX)sha256-armv8$(OBJ_SUFFIX): CFLAGS += -march=armv8-a+crypto
+ endif
+ 
++ifeq ($(CPU_ARCH),riscv64)
++$(OBJDIR)/$(PROG_PREFIX)aes-riscv64zkn$(OBJ_SUFFIX): CFLAGS += -march=rv64gczk
++endif
++
+ ifeq ($(CPU_ARCH),ppc)
+ $(OBJDIR)/$(PROG_PREFIX)sha512$(OBJ_SUFFIX): CFLAGS += -funroll-loops -fpeel-loops
+ ifneq ($(NSS_DISABLE_ALTIVEC),1)
+diff -r cd87eef15f8d lib/freebl/aes-riscv64zkn.c
+--- /dev/null	Thu Jan 01 00:00:00 1970 +0000
++++ b/lib/freebl/aes-riscv64zkn.c	Fri Dec 20 22:58:24 2024 +0900
+@@ -0,0 +1,350 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++#include "secerr.h"
++#include "rijndael.h"
++
++#include <riscv_crypto.h>
++
++#if !defined(__riscv_zknd) || !defined(__riscv_zkne)
++#error "Required -mach=rv64gczk to support scalar crypto extension."
++#endif
++
++static void
++riscv64zkn_aes_encrypt_block(AESContext *cx, unsigned char *output,
++                             const unsigned char *input)
++{
++    PRUint64 c0, c1;
++    PRUint32 r;
++    PRUint64 state0, state1;
++    const PRUint64 *expandedKey;
++
++    expandedKey = (const PRUint64 *)cx->k.expandedKey;
++    state0 = *((PRUint64 *)input);
++    state1 = *((PRUint64 *)(input + 8));
++
++    /* Add round key 0 to initial state */
++    state0 = state0 ^ *expandedKey++;
++    state1 = state1 ^ *expandedKey++;
++
++    for (r = 1; r < cx->Nr; r++) {
++        c0 = __riscv_aes64esm(state0, state1);
++        c1 = __riscv_aes64esm(state1, state0);
++        state0 = c0 ^ *expandedKey++;
++        state1 = c1 ^ *expandedKey++;
++    }
++
++    /* Final round */
++    c0 = __riscv_aes64es(state0, state1);
++    c1 = __riscv_aes64es(state1, state0);
++    state0 = c0 ^ *expandedKey++;
++    state1 = c1 ^ *expandedKey;
++
++    *((PRUint64 *)output) = state0;
++    *((PRUint64 *)(output + 8)) = state1;
++}
++
++static void
++riscv64zkn_aes_decrypt_block(AESContext *cx, unsigned char *output,
++                             const unsigned char *input)
++{
++    PRUint64 c0, c1;
++    PRUint32 r;
++    PRUint64 state0, state1;
++    const PRUint64 *expandedKey;
++
++    expandedKey = (const PRUint64 *)(cx->k.expandedKey + cx->Nb * cx->Nr + 2);
++
++    state0 = *((const PRUint64 *)input);
++    state1 = *((const PRUint64 *)(input + 8));
++
++    /* Add round key 0 to initial state */
++    state1 = state1 ^ *expandedKey--;
++    state0 = state0 ^ *expandedKey--;
++
++    for (r = cx->Nr - 1; r > 0; r--) {
++        c0 = __riscv_aes64dsm(state0, state1);
++        c1 = __riscv_aes64dsm(state1, state0);
++        state1 = c1 ^ *expandedKey--;
++        state0 = c0 ^ *expandedKey--;
++    }
++
++    /* Final round */
++    c0 = __riscv_aes64ds(state0, state1);
++    c1 = __riscv_aes64ds(state1, state0);
++    state1 = c1 ^ *expandedKey--;
++    state0 = c0 ^ *expandedKey;
++
++    *((PRUint64 *)output) = state0;
++    *((PRUint64 *)(output + 8)) = state1;
++}
++
++SECStatus
++riscv64zkn_aes_encrypt_ecb(AESContext *cx, unsigned char *output,
++                           unsigned int *outputLen,
++                           unsigned int maxOutputLen,
++                           const unsigned char *input,
++                           unsigned int inputLen,
++                           unsigned int blocksize)
++{
++    if (!inputLen) {
++        return SECSuccess;
++    }
++
++    while (inputLen > 0) {
++        riscv64zkn_aes_encrypt_block(cx, output, input);
++        input += 16;
++        output += 16;
++        inputLen -= 16;
++    }
++
++    return SECSuccess;
++}
++
++SECStatus
++riscv64zkn_aes_encrypt_cbc(AESContext *cx, unsigned char *output,
++                           unsigned int *outputLen,
++                           unsigned int maxOutputLen,
++                           const unsigned char *input,
++                           unsigned int inputLen,
++                           unsigned int blocksize)
++{
++    PRUint64 iv0, iv1;
++    PRUint64 inblock[2];
++
++    if (!inputLen) {
++        return SECSuccess;
++    }
++
++    iv0 = *((PRUint64 *)(cx->iv));
++    iv1 = *((PRUint64 *)(cx->iv + 8));
++
++    while (inputLen > 0) {
++        inblock[0] = *((PRUint64 *)input) ^ iv0;
++        inblock[1] = *((PRUint64 *)(input + 8)) ^ iv1;
++        riscv64zkn_aes_encrypt_block(cx, output, (unsigned char *)inblock);
++        iv0 = *((PRUint64 *)output);
++        iv1 = *((PRUint64 *)(output + 8));
++        input += 16;
++        output += 16;
++        inputLen -= 16;
++    }
++
++    *((PRUint64 *)(cx->iv)) = iv0;
++    *((PRUint64 *)(cx->iv + 8)) = iv1;
++
++    return SECSuccess;
++}
++
++SECStatus
++riscv64zkn_aes_decrypt_ecb(AESContext *cx, unsigned char *output,
++                           unsigned int *outputLen,
++                           unsigned int maxOutputLen,
++                           const unsigned char *input,
++                           unsigned int inputLen,
++                           unsigned int blocksize)
++{
++    if (inputLen == 0) {
++        return SECSuccess;
++    }
++
++    while (inputLen > 0) {
++        riscv64zkn_aes_decrypt_block(cx, output, input);
++        input += 16;
++        inputLen -= 16;
++        output += 16;
++    }
++
++    return SECSuccess;
++}
++
++SECStatus
++riscv64zkn_aes_decrypt_cbc(AESContext *cx, unsigned char *output,
++                           unsigned int *outputLen,
++                           unsigned int maxOutputLen,
++                           const unsigned char *input,
++                           unsigned int inputLen,
++                           unsigned int blocksize)
++{
++    PRUint64 iv0, iv1;
++    PRUint64 oldin0, oldin1;
++
++    if (inputLen == 0) {
++        return SECSuccess;
++    }
++
++    iv0 = *((PRUint64 *)(cx->iv));
++    iv1 = *((PRUint64 *)(cx->iv + 8));
++
++    while (inputLen > 0) {
++        oldin0 = *((PRUint64 *)input);
++        oldin1 = *((PRUint64 *)(input + 8));
++        riscv64zkn_aes_decrypt_block(cx, output, input);
++        *((PRUint64 *)output) ^= iv0;
++        *((PRUint64 *)(output + 8)) ^= iv1;
++        iv0 = oldin0;
++        iv1 = oldin1;
++        input += 16;
++        inputLen -= 16;
++        output += 16;
++    }
++
++    *((PRUint64 *)(cx->iv)) = iv0;
++    *((PRUint64 *)(cx->iv + 8)) = iv1;
++
++    return SECSuccess;
++}
++
++#if 0
++#define EXPAND_KEY128(t0, t1, n)    \
++    tmp = __riscv_aes64ks1i(t1, n); \
++    t0 = __riscv_aes64ks2(tmp, t0); \
++    t1 = __riscv_aes64ks2(t0, t1);  \
++    *expandedKey++ = t0;            \
++    *expandedKey++ = t1;
++
++static void
++riscv64zkn_key_expansion_128(AESContext *cx, const unsigned char *key)
++{
++    PRUint64 t0, t1, tmp;
++    PRUint64 *expandedKey;
++
++    expandedKey = (PRUint64 *)(cx->k.expandedKey);
++
++    t0 = *((PRUint64 *)key);
++    t1 = *((PRUint64 *)(key + 8));
++    *expandedKey++ = t0;
++    *expandedKey++ = t1;
++
++    EXPAND_KEY128(t0, t1, 0);
++    EXPAND_KEY128(t0, t1, 1);
++    EXPAND_KEY128(t0, t1, 2);
++    EXPAND_KEY128(t0, t1, 3);
++    EXPAND_KEY128(t0, t1, 4);
++    EXPAND_KEY128(t0, t1, 5);
++    EXPAND_KEY128(t0, t1, 6);
++    EXPAND_KEY128(t0, t1, 7);
++    EXPAND_KEY128(t0, t1, 8);
++    EXPAND_KEY128(t0, t1, 9);
++}
++
++#define EXPAND_KEY192(t0, t1, t2, n) \
++    tmp = __riscv_aes64ks1i(t2, n);  \
++    t0 = __riscv_aes64ks2(tmp, t0);  \
++    t1 = __riscv_aes64ks2(t0, t1);   \
++    t2 = __riscv_aes64ks2(t1, t2);   \
++    *expandedKey++ = t0;             \
++    *expandedKey++ = t1;             \
++    *expandedKey++ = t2;
++
++static void
++riscv64zkn_key_expansion_192(AESContext *cx, const unsigned char *key)
++{
++    PRUint64 t0, t1, t2, tmp;
++    PRUint64 *expandedKey;
++
++    expandedKey = (PRUint64 *)(cx->k.expandedKey);
++
++    t0 = *((PRUint64 *)key);
++    t1 = *((PRUint64 *)(key + 8));
++    t2 = *((PRUint64 *)(key + 16));
++    *expandedKey++ = t0;
++    *expandedKey++ = t1;
++    *expandedKey++ = t2;
++
++    EXPAND_KEY192(t0, t1, t2, 0);
++    EXPAND_KEY192(t0, t1, t2, 1);
++    EXPAND_KEY192(t0, t1, t2, 2);
++    EXPAND_KEY192(t0, t1, t2, 3);
++    EXPAND_KEY192(t0, t1, t2, 4);
++    EXPAND_KEY192(t0, t1, t2, 5);
++    EXPAND_KEY192(t0, t1, t2, 6);
++
++    tmp = __riscv_aes64ks1i(t2, 7);
++    t0 = __riscv_aes64ks2(tmp, t0);
++    t1 = __riscv_aes64ks2(t0, t1);
++    *expandedKey++ = t0;
++    *expandedKey++ = t1;
++}
++
++#define EXPAND_KEY256(t0, t1, t2, t3, n) \
++    tmp = __riscv_aes64ks1i(t3, n);      \
++    t0 = __riscv_aes64ks2(tmp, t0);      \
++    t1 = __riscv_aes64ks2(t0, t1);       \
++    tmp = __riscv_aes64ks1i(t1, 10);     \
++    t2 = __riscv_aes64ks2(tmp, t2);      \
++    t3 = __riscv_aes64ks2(t2, t3);       \
++    *expandedKey++ = t0;                 \
++    *expandedKey++ = t1;                 \
++    *expandedKey++ = t2;                 \
++    *expandedKey++ = t3;
++
++static void
++riscv64zkn_key_expansion_256(AESContext *cx, const unsigned char *key)
++{
++    PRUint64 t0, t1, t2, t3, tmp;
++    PRUint64 *expandedKey;
++
++    expandedKey = (PRUint64 *)(cx->k.expandedKey);
++
++    t0 = *((PRUint64 *)key);
++    t1 = *((PRUint64 *)(key + 8));
++    t2 = *((PRUint64 *)(key + 16));
++    t3 = *((PRUint64 *)(key + 24));
++    *expandedKey++ = t0;
++    *expandedKey++ = t1;
++    *expandedKey++ = t2;
++    *expandedKey++ = t3;
++
++    EXPAND_KEY256(t0, t1, t2, t3, 0);
++    EXPAND_KEY256(t0, t1, t2, t3, 1);
++    EXPAND_KEY256(t0, t1, t2, t3, 2);
++    EXPAND_KEY256(t0, t1, t2, t3, 3);
++    EXPAND_KEY256(t0, t1, t2, t3, 4);
++    EXPAND_KEY256(t0, t1, t2, t3, 5);
++
++    tmp = __riscv_aes64ks1i(t3, 6);
++    t0 = __riscv_aes64ks2(tmp, t0);
++    t1 = __riscv_aes64ks2(t0, t1);
++    *expandedKey++ = t0;
++    *expandedKey = t1;
++}
++
++#define INV_EXPAND_KEY128(t0, t1, n)      \
++    tmp = __riscv_aes64ks1i(t1, n);       \
++    t0 = __riscv_aes64ks2(tmp, t0);       \
++    t1 = __riscv_aes64ks2(t0, t1);        \
++    *expandedKey++ = __riscv_aes64im(t0); \
++    *expandedKey++ = __riscv_aes64im(t1);
++
++static void
++riscv64zkn_invkey_expansion_128(AESContext *cx, const unsigned char *key)
++{
++    PRUint64 t0, t1, tmp;
++    PRUint64 *expandedKey;
++
++    expandedKey = (PRUint64 *)(cx->k.expandedKey);
++
++    t0 = *((PRUint64 *)key);
++    t1 = *((PRUint64 *)(key + 8));
++    *expandedKey++ = t0;
++    *expandedKey++ = t1;
++
++    INV_EXPAND_KEY128(t0, t1, 0);
++    INV_EXPAND_KEY128(t0, t1, 1);
++    INV_EXPAND_KEY128(t0, t1, 2);
++    INV_EXPAND_KEY128(t0, t1, 3);
++    INV_EXPAND_KEY128(t0, t1, 4);
++    INV_EXPAND_KEY128(t0, t1, 5);
++    INV_EXPAND_KEY128(t0, t1, 6);
++    INV_EXPAND_KEY128(t0, t1, 7);
++    INV_EXPAND_KEY128(t0, t1, 8);
++
++    tmp = __riscv_aes64ks1i(t1, 9);
++    t0 = __riscv_aes64ks2(tmp, t0);
++    t1 = __riscv_aes64ks2(t0, t1);
++    *expandedKey++ = t0;
++    *expandedKey = t1;
++}
++#endif
+diff -r cd87eef15f8d lib/freebl/aes-riscv64zkn.h
+--- /dev/null	Thu Jan 01 00:00:00 1970 +0000
++++ b/lib/freebl/aes-riscv64zkn.h	Fri Dec 20 22:58:24 2024 +0900
+@@ -0,0 +1,37 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++SECStatus riscv64zkn_aes_encrypt_ecb(AESContext *cx, unsigned char *output,
++                                     unsigned int *outputLen,
++                                     unsigned int maxOutputLen,
++                                     const unsigned char *input,
++                                     unsigned int inputLen,
++                                     unsigned int blocksize);
++SECStatus riscv64zkn_aes_encrypt_cbc(AESContext *cx, unsigned char *output,
++                                     unsigned int *outputLen,
++                                     unsigned int maxOutputLen,
++                                     const unsigned char *input,
++                                     unsigned int inputLen,
++                                     unsigned int blocksize);
++SECStatus riscv64zkn_aes_decrypt_ecb(AESContext *cx, unsigned char *output,
++                                     unsigned int *outputLen,
++                                     unsigned int maxOutputLen,
++                                     const unsigned char *input,
++                                     unsigned int inputLen,
++                                     unsigned int blocksize);
++SECStatus riscv64zkn_aes_decrypt_cbc(AESContext *cx, unsigned char *output,
++                                     unsigned int *outputLen,
++                                     unsigned int maxOutputLen,
++                                     const unsigned char *input,
++                                     unsigned int inputLen,
++                                     unsigned int blocksize);
++
++#define native_aes_init(encrypt, keysize)           \
++    do {                                            \
++        if (encrypt) {                              \
++            rijndael_key_expansion(cx, key, Nk);    \
++        } else {                                    \
++            rijndael_invkey_expansion(cx, key, Nk); \
++        }                                           \
++    } while (0)
+diff -r cd87eef15f8d lib/freebl/freebl.gyp
+--- a/lib/freebl/freebl.gyp	Mon Dec 16 11:56:39 2024 -0800
++++ b/lib/freebl/freebl.gyp	Fri Dec 20 22:58:24 2024 +0900
+@@ -491,6 +491,26 @@
+       ]
+     },
+     {
++      'target_name': 'riscv64zkn_c_lib',
++      'type': 'static_library',
++      'sources': [
++        'aes-riscv64zkn.c',
++      ],
++      'dependencies': [
++        '<(DEPTH)/exports.gyp:nss_exports'
++      ],
++      'conditions': [
++        [ 'target_arch=="riscv64"', {
++          'cflags': [
++            '-march=rv64gczk'
++          ],
++          'cflags_mozilla': [
++            '-march=rv64gczk'
++          ],
++        }]
++      ]
++    },
++    {
+       'target_name': 'freebl',
+       'type': 'static_library',
+       'sources': [
+@@ -568,6 +588,11 @@
+             'NSS_DISABLE_CRYPTO_VSX',
+           ],
+         }],
++        [ '(disable_riscv64zkn==0 and target_arch=="riscv64"', {
++          'dependencies': [
++            'riscv64zkn_c_lib',
++          ],
++        }],
+         [ 'OS=="linux"', {
+           'defines!': [
+             'FREEBL_NO_DEPEND',
+@@ -657,6 +682,11 @@
+             'NSS_DISABLE_CRYPTO_VSX',
+           ],
+         }],
++        [ 'target_arch=="riscv64"', {
++          'dependencies': [
++            'riscv64zkn_c_lib',
++          ],
++        }],
+         [ 'OS!="linux"', {
+           'conditions': [
+             [ 'moz_fold_libs==0', {
+@@ -934,6 +964,11 @@
+               'USE_HW_SHA2',
+             ],
+           }],
++          [ 'disable_riscv64zkn==0 and target_arch=="riscv64"', {
++            'defines': [
++              'USE_HW_AES',
++            ],
++          }],
+         ],
+       }],
+     ],
+diff -r cd87eef15f8d lib/freebl/rijndael.c
+--- a/lib/freebl/rijndael.c	Mon Dec 16 11:56:39 2024 -0800
++++ b/lib/freebl/rijndael.c	Fri Dec 20 22:58:24 2024 +0900
+@@ -33,6 +33,8 @@
+ #ifdef USE_HW_AES
+ #ifdef NSS_X86_OR_X64
+ #include "intel-aes.h"
++#elif defined(__riscv) && defined(__riscv_xlen) && __riscv_xlen == 64
++#include "aes-riscv64zkn.h"
+ #else
+ #include "aes-armv8.h"
+ #endif
+@@ -917,6 +919,21 @@
+          : ((keysize) == 16   ? freeblCipher_intel_aes_decrypt_cbc_128  \
+             : (keysize) == 24 ? freeblCipher_intel_aes_decrypt_cbc_192  \
+                               : freeblCipher_intel_aes_decrypt_cbc_256))
++#elif defined(__riscv) && defined(__riscv_xlen) && __riscv_xlen == 64
++FREEBL_CIPHER_WRAP(AESContext, riscv64zkn_aes_encrypt_ecb);
++FREEBL_CIPHER_WRAP(AESContext, riscv64zkn_aes_encrypt_cbc);
++FREEBL_CIPHER_WRAP(AESContext, riscv64zkn_aes_decrypt_ecb);
++FREEBL_CIPHER_WRAP(AESContext, riscv64zkn_aes_decrypt_cbc);
++
++#define freeblCipher_native_aes_ecb_worker(encrypt, keysize) \
++    ((encrypt)                                               \
++         ? freeblCipher_riscv64zkn_aes_encrypt_ecb           \
++         : freeblCipher_riscv64zkn_aes_decrypt_ecb)
++
++#define freeblCipher_native_aes_cbc_worker(encrypt, keysize) \
++    ((encrypt)                                               \
++         ? freeblCipher_riscv64zkn_aes_encrypt_cbc           \
++         : freeblCipher_riscv64zkn_aes_decrypt_cbc)
+ #else
+ FREEBL_CIPHER_WRAP(AESContext, arm_aes_encrypt_ecb_128);
+ FREEBL_CIPHER_WRAP(AESContext, arm_aes_decrypt_ecb_128);
